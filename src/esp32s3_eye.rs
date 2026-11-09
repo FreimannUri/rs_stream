@@ -1,10 +1,10 @@
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{Duration, Instant, with_timeout};
 use esp_hal::Blocking;
 use esp_hal::delay::Delay;
 use esp_hal::dma::DmaRxBuf;
-use esp_hal::dma::{DmaDescriptor, aligned::DmaAlignedMut};
+use esp_hal::dma::{DmaDescriptor, ExternalBurstConfig, aligned::DmaAlignedMut};
 use esp_hal::gpio::interconnect::{PeripheralInput, PeripheralOutput};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::lcd_cam::cam::{Camera, Config, EofMode};
@@ -21,6 +21,8 @@ pub struct Esp32S3Eye<S: Sensor> {
     pub i2c: I2c<'static, Blocking>,
     pub camera: Option<Camera<'static>>,
     pub sensor: S,
+
+    last_ok_ms: u64,
 }
 
 impl<S: Sensor> Esp32S3Eye<S> {
@@ -87,21 +89,15 @@ impl<S: Sensor> Esp32S3Eye<S> {
             i2c,
             camera: Some(camera),
             sensor,
+            last_ok_ms: 750,
         })
     }
 
-    /// Один кадр до EOF. Буфер возвращается всегда, и при ошибке тоже.
     pub async fn capture(&mut self, rx_buf: DmaRxBuf) -> Result<DmaRxBuf, (BoardError, DmaRxBuf)> {
         let Some(camera) = self.camera.take() else {
             return Err((BoardError::CameraNotAvailable, rx_buf));
         };
         let camera = camera.into_async();
-
-        let regs = unsafe { &*esp_hal::peripherals::LCD_CAM::PTR };
-        println!(
-            "cam_vs_eof_en = {}",
-            regs.cam_ctrl().read().cam_vs_eof_en().bit()
-        );
 
         let mut transfer = match camera.receive(rx_buf) {
             Ok(t) => t,
@@ -111,12 +107,17 @@ impl<S: Sensor> Esp32S3Eye<S> {
             }
         };
 
-        let res = with_timeout(Duration::from_secs(3), transfer.wait_for_dma_eof()).await;
-        let (camera, buf) = transfer.stop(); // всегда, в том числе после таймаута
+        let timeout = Duration::from_millis((self.last_ok_ms * 4).clamp(250, 3000));
+        let started = Instant::now();
+        let res = with_timeout(timeout, transfer.wait_for_dma_eof()).await;
+        let (camera, buf) = transfer.stop();
         self.camera = Some(camera.into_blocking());
 
         match res {
-            Ok(Ok(())) => Ok(buf),
+            Ok(Ok(())) => {
+                self.last_ok_ms = started.elapsed().as_millis();
+                Ok(buf)
+            }
             Ok(Err(e)) => Err((BoardError::DmaTransferError(e), buf)),
             Err(_) => Err((BoardError::CaptureTimeout, buf)),
         }
@@ -162,9 +163,11 @@ pub fn jpeg_buffers(psram_base: *mut u8) -> [DmaRxBuf; 2] {
     let make = |offset: usize, descs: *mut [DmaDescriptor; DESC_COUNT]| unsafe {
         let data = core::slice::from_raw_parts_mut(psram_base.add(offset), BUFFER_SIZE);
         let descs = core::slice::from_raw_parts_mut(descs as *mut DmaDescriptor, DESC_COUNT);
-        DmaRxBuf::new(
+
+        DmaRxBuf::new_with_config(
             DmaAlignedMut::new(descs).unwrap(),
             DmaAlignedMut::new(data).unwrap(),
+            ExternalBurstConfig::Size64,
         )
         .unwrap()
     };
@@ -183,8 +186,6 @@ pub fn jpeg_slice(buf: &DmaRxBuf) -> Option<&[u8]> {
     (end > start).then(|| &data[start..end + 2])
 }
 
-// ------- Временный обход: Flash QE для Macronix (esp-hal #6456 / #6492) -------
-// Не имеет отношения к камере. Удалить целиком, когда поправят в апстриме.
 unsafe extern "C" {
     static rom_spiflash_legacy_data: *mut u8;
     fn esp_rom_spiflash_read_user_cmd(status: *mut u32, cmd: u8) -> i32;

@@ -1,191 +1,351 @@
 #![no_std]
 #![no_main]
 
-use embassy_time::Timer;
+use core::fmt::Write as _;
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering::Relaxed};
+
+use embassy_executor::Spawner;
+use embassy_futures::{
+    join::join4,
+    select::{Either, select},
+};
+use embassy_net::{Runner, Stack, StackResources, tcp::TcpSocket};
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::{
+    clock::CpuClock,
+    dma::DmaRxBuf,
     lcd_cam::cam::EofMode,
     psram::{Psram, PsramConfig, SpiRamFreq, SpiTimingConfigCoreClock},
+    rng::Rng,
     timer::timg::TimerGroup,
+    tsens::{Config as TsConfig, TemperatureSensor},
 };
 use esp_println::println;
+use esp_radio::wifi::{
+    AuthenticationMethodConfig, Config as WifiConfig, Interface, PowerSaveMode, WifiController,
+    sta::StationConfig,
+};
+use heapless::String;
 use rs_stream::{
-    Esp32S3Eye, ensure_flash_qe, flash_sr1, jpeg_buffers, jpeg_slice,
+    Esp32S3Eye, ensure_flash_qe, jpeg_buffers, jpeg_slice,
     sensors::{Resolution, ov5640::Ov5640},
 };
+use static_cell::StaticCell;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// const QSCALE: u8 = 0x0C;
+const SSID: &str = "BALTICOM2G_3124301";
+const PASSWORD: &str = "zeyhd4xpgmte";
 
-use esp_hal::dma::DmaRxBuf;
-use rs_stream::sensors::Sensor;
+const SERVER: (u8, u8, u8, u8) = (192, 168, 80, 136);
+const INGEST_PORT: u16 = 9000;
+const STATS_PORT: u16 = 9001;
 
-fn reinit(eye: &mut Esp32S3Eye<Ov5640>) {
-    eye.sensor.init(&mut eye.i2c).unwrap();
+// const RESOLUTION: Resolution = Resolution::Hd720;
+const RESOLUTION: Resolution = Resolution::FullHd;
+const JPEG_QSCALE: u8 = 0x04;
+
+// const HTTP_PORT: u16 = 80;
+const TCP_TX_BUF: usize = 32 * 1024;
+// const TCP_RX_BUF: usize = 1024;
+
+// Counters shared between tasks; `stats_push` reports and resets them once a second.
+static CAPTURED: AtomicU32 = AtomicU32::new(0);
+static INVALID: AtomicU32 = AtomicU32::new(0);
+static ERRORS: AtomicU32 = AtomicU32::new(0);
+static SENT: AtomicU32 = AtomicU32::new(0);
+static SENT_BYTES: AtomicU32 = AtomicU32::new(0);
+static SEND_US: AtomicU32 = AtomicU32::new(0);
+static DROPPED: AtomicU32 = AtomicU32::new(0);
+static FREE_WAIT_US: AtomicU32 = AtomicU32::new(0);
+static LAG_MAX_US: AtomicU32 = AtomicU32::new(0);
+// Totals since boot (never reset)
+static WIFI_DROPS: AtomicU32 = AtomicU32::new(0);
+static PUSH_DROPS: AtomicU32 = AtomicU32::new(0);
+static RSSI: AtomicI32 = AtomicI32::new(0);
+
+macro_rules! mk_static {
+    ($t:ty, $val:expr) => {{
+        static CELL: StaticCell<$t> = StaticCell::new();
+        CELL.init($val)
+    }};
 }
 
-// fn probe(label: impl core::fmt::Debug) {
-//     use esp_hal::time::{Duration, Instant};
-//     let gpio = unsafe { &*esp_hal::peripherals::GPIO::PTR };
-//     let (mut vs, mut hr) = (0u32, 0u32);
-//     let first = gpio.in_().read().bits();
-//     let mut last = first;
-//     let t0 = Instant::now();
-//     while t0.elapsed() < Duration::from_millis(1500) {
-//         let now = gpio.in_().read().bits();
-//         let ch = now ^ last;
-//         if ch & (1 << 6) != 0 {
-//             vs += 1;
-//         }
-//         if ch & (1 << 7) != 0 {
-//             hr += 1;
-//         }
-//         last = now;
-//     }
-//     println!(
-//         "[probe {:?}] VSYNC edges={} (lvl {}), HREF edges={} (lvl {})",
-//         label,
-//         vs,
-//         (first >> 6) & 1,
-//         hr,
-//         (first >> 7) & 1
-//     );
-// }
+trait WriteAll {
+    async fn write_all(&mut self, data: &[u8]) -> Result<(), embassy_net::tcp::Error>;
+}
 
-fn _probe2(label: &str, ms: u64) {
-    use esp_hal::time::{Duration, Instant};
-    let gpio = unsafe { &*esp_hal::peripherals::GPIO::PTR };
-    let t0 = Instant::now();
-    let mut last = gpio.in_().read().bits();
-    let (mut samples, mut vs, mut hr) = (0u32, 0usize, 0u32);
-    let mut vs_t = [0u64; 8]; // время первых фронтов VSYNC, мкс от старта
-    while t0.elapsed() < Duration::from_millis(ms) {
-        let now = gpio.in_().read().bits();
-        samples += 1;
-        let ch = now ^ last;
-        if ch & (1 << 6) != 0 {
-            if vs < 8 {
-                vs_t[vs] = t0.elapsed().as_micros();
+impl WriteAll for TcpSocket<'_> {
+    async fn write_all(&mut self, mut data: &[u8]) -> Result<(), embassy_net::tcp::Error> {
+        while !data.is_empty() {
+            let n = self.write(data).await?;
+            if n == 0 {
+                return Err(embassy_net::tcp::Error::ConnectionReset);
             }
-            vs += 1;
+            data = &data[n..];
         }
-        if ch & (1 << 7) != 0 {
-            hr += 1;
-        }
-        last = now;
+        Ok(())
     }
-    println!(
-        "[{}] {} ms: samples/ms={}, VSYNC edges={} at {:?} us, HREF edges={}, final lvl vs={} hr={}",
-        label,
-        ms,
-        samples as u64 / ms,
-        vs,
-        &vs_t[..vs.min(8)],
-        hr,
-        (last >> 6) & 1,
-        (last >> 7) & 1
+}
+
+type BufChannel = Channel<NoopRawMutex, DmaRxBuf, 2>;
+
+#[embassy_executor::task]
+async fn wifi_task(mut controller: WifiController<'static>) {
+    let cfg = WifiConfig::Station(
+        StationConfig::default()
+            .with_ssid(match SSID.try_into() {
+                Ok(s) => s,
+                Err(_) => panic!("SSID is too long"),
+            })
+            .with_authentication(AuthenticationMethodConfig::Wpa2Personal(
+                match PASSWORD.try_into() {
+                    Ok(p) => p,
+                    Err(_) => panic!("Wrong Wi-Fi password"),
+                },
+            )),
     );
-}
 
-fn _probe_data_pins(ms: u64) {
-    use esp_hal::time::{Duration, Instant};
-    let gpio = unsafe { &*esp_hal::peripherals::GPIO::PTR };
-    let pins: [u32; 9] = [11, 9, 8, 47, 12, 18, 17, 16, 10]; // d0..d7 как у тебя, плюс GPIO10
-    let mut cnt = [0u32; 9];
-    let mut last_lo = gpio.in_().read().bits();
-    let mut last_hi = gpio.in1().read().bits();
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_millis(ms) {
-        let lo = gpio.in_().read().bits();
-        let hi = gpio.in1().read().bits();
-        for (i, &p) in pins.iter().enumerate() {
-            let changed = if p < 32 {
-                (lo ^ last_lo) >> p & 1
-            } else {
-                (hi ^ last_hi) >> (p - 32) & 1
-            };
-            cnt[i] += changed;
-        }
-        last_lo = lo;
-        last_hi = hi;
-    }
-    for (i, &p) in pins.iter().enumerate() {
-        println!("[pins] GPIO{} edges={}", p, cnt[i]);
-    }
-}
+    controller.set_config(&cfg).unwrap();
 
-// fn wr(i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>, regs: &[[u16; 2]]) {
-//     for e in regs {
-//         i2c.write(0x3C, &[(e[0] >> 8) as u8, e[0] as u8, e[1] as u8])
-//             .unwrap();
-//     }
-// }
-// fn rd8(i2c: &mut esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>, reg: u16) -> u8 {
-//     let mut b = [0u8];
-//     i2c.write_read(0x3C, &[(reg >> 8) as u8, reg as u8], &mut b)
-//         .unwrap();
-//     b[0]
-// }
+    controller.set_power_saving(PowerSaveMode::None).unwrap();
 
-fn dbg_frame(n: usize, buf: &DmaRxBuf) {
-    let data = buf.as_slice();
-    let rep = buf.number_of_received_bytes().min(data.len());
-    let rx = &data[..rep];
-    let first = |p: [u8; 2]| rx.windows(2).position(|w| w == p);
-    let last = |p: [u8; 2]| rx.windows(2).rposition(|w| w == p);
-    let zeros = rx.iter().filter(|&&b| b == 0).count();
-
-    println!("[dbg #{}] rep={} head={:02X?}", n, rep, &rx[..16.min(rep)]);
-    println!("[dbg #{}] tail={:02X?}", n, &rx[rep.saturating_sub(16)..]);
-    println!(
-        "[dbg #{}] FFD8@{:?} D8FF@{:?} FFD9@{:?} D9FF@{:?} zeros={}/{}",
-        n,
-        first([0xFF, 0xD8]),
-        first([0xD8, 0xFF]),
-        last([0xFF, 0xD9]),
-        last([0xD9, 0xFF]),
-        zeros,
-        rep
-    );
-}
-
-fn dbg_structure(n: usize, buf: &DmaRxBuf) {
-    let data = buf.as_slice();
-    let rep = buf.number_of_received_bytes().min(data.len());
-    let rx = &data[..rep];
-
-    let mut cnt = 0usize;
-    for i in 0..rx.len().saturating_sub(1) {
-        if rx[i] == 0xFF && rx[i + 1] != 0x00 && rx[i + 1] != 0xFF {
-            if cnt < 14 {
-                println!("[struct #{}] marker FF{:02X} @{}", n, rx[i + 1], i);
+    loop {
+        match controller.connect_async().await {
+            Ok(_) => {
+                println!("[wifi] connected");
+                loop {
+                    let ev =
+                        select(controller.wait_for_disconnect_async(), Timer::after_secs(1)).await;
+                    match ev {
+                        Either::First(_) => break,
+                        Either::Second(_) => {
+                            if let Ok(r) = controller.rssi() {
+                                RSSI.store(r, Relaxed);
+                            }
+                        }
+                    }
+                }
+                WIFI_DROPS.fetch_add(1, Relaxed);
+                println!("[wifi] disconnected, reconnecting");
             }
-            cnt += 1;
+            Err(e) => println!("[wifi] connect failed: {:?}", e),
         }
+        Timer::after_millis(1000).await;
     }
-    println!("[struct #{}] total markers={}", n, cnt);
+}
 
-    match rx.iter().rposition(|&b| b != 0) {
-        Some(e) => {
-            let from = e.saturating_sub(15);
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface>) {
+    runner.run().await
+}
+
+async fn capture_loop(eye: &mut Esp32S3Eye<Ov5640>, free: &BufChannel, filled: &BufChannel) -> ! {
+    let (mut total, mut invalid, mut errors) = (0u32, 0u32, 0u32);
+    let mut t0 = Instant::now();
+    loop {
+        let waited = Instant::now();
+        let buf = free.receive().await;
+        FREE_WAIT_US.fetch_add(waited.elapsed().as_micros() as u32, Relaxed);
+        let started = Instant::now();
+        match eye.capture(buf).await {
+            Ok(buf) => {
+                total += 1;
+                CAPTURED.fetch_add(1, Relaxed);
+
+                if jpeg_slice(&buf).is_some() {
+                    filled.send(buf).await;
+                } else {
+                    invalid += 1;
+                    INVALID.fetch_add(1, Relaxed);
+                    free.send(buf).await;
+                }
+            }
+            Err((e, buf)) => {
+                errors += 1;
+                ERRORS.fetch_add(1, Relaxed);
+
+                let rx = buf.number_of_received_bytes();
+                let valid = jpeg_slice(&buf).is_some();
+                println!(
+                    "[cam] {:?} after {} ms: rx {} B, jpeg {}",
+                    e,
+                    started.elapsed().as_millis(),
+                    rx,
+                    if valid {
+                        "VALID (salvaged)"
+                    } else {
+                        "incomplete"
+                    }
+                );
+                if valid {
+                    filled.send(buf).await;
+                } else {
+                    free.send(buf).await;
+                    Timer::after_millis(10).await;
+                }
+            }
+        }
+        if t0.elapsed() >= Duration::from_secs(1) {
             println!(
-                "[struct #{}] last non-zero @{} of {}: {:02X?}",
-                n,
-                e,
-                rep,
-                &rx[from..=e]
+                "[cap] captures/s {} (invalid {}), errors {}",
+                total, invalid, errors
             );
+            (total, invalid, errors) = (0, 0, 0);
+            t0 = Instant::now();
         }
-        None => println!("[struct #{}] all zeros", n),
+    }
+}
+
+async fn push(stack: Stack<'static>, free: &BufChannel, filled: &BufChannel) -> ! {
+    let rx = mk_static!([u8; 64], [0; 64]);
+    let tx = mk_static!([u8; TCP_TX_BUF], [0; TCP_TX_BUF]);
+    let ep = (
+        embassy_net::Ipv4Address::new(SERVER.0, SERVER.1, SERVER.2, SERVER.3),
+        INGEST_PORT,
+    );
+
+    loop {
+        let mut sock = TcpSocket::new(stack, rx, tx);
+        sock.set_timeout(Some(Duration::from_secs(5)));
+
+        if sock.connect(ep).await.is_err() {
+            // laptop/ffmpeg not listening yet: drop stale frames and retry
+            while let Ok(b) = filled.try_receive() {
+                free.send(b).await;
+            }
+            Timer::after_millis(1000).await;
+            continue;
+        }
+        println!("[push] connected");
+
+        loop {
+            let mut buf = filled.receive().await;
+            // keep only the newest frame
+            while let Ok(newer) = filled.try_receive() {
+                free.send(buf).await;
+                buf = newer;
+                DROPPED.fetch_add(1, Relaxed);
+            }
+            let ok = match jpeg_slice(&buf) {
+                Some(j) => {
+                    let t = Instant::now();
+                    let r = sock.write_all(j).await.is_ok();
+                    if r {
+                        SENT.fetch_add(1, Relaxed);
+                        SENT_BYTES.fetch_add(j.len() as u32, Relaxed);
+                        SEND_US.fetch_add(t.elapsed().as_micros() as u32, Relaxed);
+                    }
+                    r
+                }
+                None => true,
+            };
+            free.send(buf).await;
+            if !ok {
+                break;
+            }
+        }
+        sock.abort();
+        PUSH_DROPS.fetch_add(1, Relaxed);
+        println!("[push] disconnected");
+    }
+}
+
+// Measures how late a 10 ms timer fires: a proxy for how busy the executor is.
+async fn lag_probe() -> ! {
+    loop {
+        let t = Instant::now();
+        Timer::after_millis(10).await;
+        let lag = t.elapsed().as_micros().saturating_sub(10_000) as u32;
+        LAG_MAX_US.fetch_max(lag, Relaxed);
+    }
+}
+
+// Sends one JSON line per second to the collector on the laptop.
+async fn stats_push(stack: Stack<'static>, mut tsens: TemperatureSensor<'static>) -> ! {
+    let rx = mk_static!([u8; 64], [0; 64]);
+    let tx = mk_static!([u8; 512], [0; 512]);
+    let ep = (
+        embassy_net::Ipv4Address::new(SERVER.0, SERVER.1, SERVER.2, SERVER.3),
+        STATS_PORT,
+    );
+    let boot = Instant::now();
+
+    loop {
+        let mut sock = TcpSocket::new(stack, rx, tx);
+        sock.set_timeout(Some(Duration::from_secs(5)));
+        if sock.connect(ep).await.is_err() {
+            Timer::after_millis(1000).await;
+            continue;
+        }
+        println!("[stats] connected");
+        // don't report what piled up while disconnected
+        for c in [
+            &CAPTURED,
+            &INVALID,
+            &ERRORS,
+            &SENT,
+            &SENT_BYTES,
+            &SEND_US,
+            &DROPPED,
+            &FREE_WAIT_US,
+            &LAG_MAX_US,
+        ] {
+            c.store(0, Relaxed);
+        }
+        loop {
+            Timer::after_secs(1).await;
+            let sent = SENT.swap(0, Relaxed);
+            let bytes = SENT_BYTES.swap(0, Relaxed);
+            let us = SEND_US.swap(0, Relaxed);
+            let send_ms = if sent > 0 { us / sent / 1000 } else { 0 };
+            let kb_frame = if sent > 0 { bytes / sent / 1024 } else { 0 };
+            let wait_pct = FREE_WAIT_US.swap(0, Relaxed) / 10_000;
+            let lag_ms = LAG_MAX_US.swap(0, Relaxed) / 1000;
+            let heap_kb = (esp_alloc::HEAP.free() / 1024) as u32;
+            let temp_c = tsens.get_temperature().to_celsius() as i32;
+
+            let mut line: String<384> = String::new();
+            let _ = write!(
+                line,
+                "{{\"up\":{},\"cap\":{},\"inv\":{},\"err\":{},\"fps\":{},\"kbs\":{},\"send_ms\":{},\"drop\":{},\
+                    \"wait\":{},\"kb_frame\":{},\"lag\":{},\"wdrops\":{},\"pdrops\":{},\
+                    \"heap\":{},\"rssi\":{},\"temp\":{}}}\n",
+                boot.elapsed().as_secs(),
+                CAPTURED.swap(0, Relaxed),
+                INVALID.swap(0, Relaxed),
+                ERRORS.swap(0, Relaxed),
+                sent,
+                bytes / 1024,
+                send_ms,
+                DROPPED.swap(0, Relaxed),
+                wait_pct,
+                kb_frame,
+                lag_ms,
+                WIFI_DROPS.load(Relaxed),
+                PUSH_DROPS.load(Relaxed),
+                heap_kb,
+                RSSI.load(Relaxed),
+                temp_c
+            );
+            if sock.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+        sock.abort();
+        println!("[stats] disconnected");
     }
 }
 
 #[esp_rtos::main]
-async fn main(_spawner: embassy_executor::Spawner) {
-    let p = esp_hal::init(esp_hal::Config::default());
+async fn main(spawner: Spawner) {
+    let p = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
-    let r = ensure_flash_qe();
-    println!("[main] ensure QE -> {}, SR1 = {:#04x}", r, flash_sr1());
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 96 * 1024);
+    ensure_flash_qe();
 
     let timg0 = TimerGroup::new(p.TIMG0);
     esp_rtos::start(timg0.timer0);
@@ -198,9 +358,22 @@ async fn main(_spawner: embassy_executor::Spawner) {
             ..Default::default()
         },
     );
-    let (psram_base, psram_size) = psram.raw_parts();
-    println!("[main] PSRAM: base {:p}, size {}", psram_base, psram_size);
+    let (psram_base, _psram_size) = psram.raw_parts();
     let [buf_a, buf_b] = jpeg_buffers(psram_base);
+
+    let controller = WifiController::new(p.WIFI, Default::default()).unwrap();
+    let sta = Interface::station();
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let (stack, runner) = embassy_net::new(
+        sta,
+        embassy_net::Config::dhcpv4(Default::default()),
+        mk_static!(StackResources<6>, StackResources::<6>::new()),
+        seed,
+    );
+    spawner.spawn(wifi_task(controller).expect("REASON"));
+    spawner.spawn(net_task(runner).expect("REASON"));
 
     let mut eye = Esp32S3Eye::<Ov5640>::init(
         p.LCD_CAM,
@@ -224,47 +397,27 @@ async fn main(_spawner: embassy_executor::Spawner) {
     )
     .unwrap();
 
-    reinit(&mut eye);
-    eye.set_jpeg(Resolution::Vga, 0x0C).unwrap(); // сначала малый режим, как в эталоне по умолчанию
+    eye.set_jpeg(RESOLUTION, JPEG_QSCALE).unwrap();
     Timer::after_millis(300).await;
 
-    // probe_data_pins(1000);
-    // probe2("jpeg vga", 2000);
+    let tsens = TemperatureSensor::new(p.TSENS, TsConfig::default()).unwrap();
+    Timer::after_micros(300).await;
 
-    // 5. Захват в два буфера по очереди
-    let mut bufs = [Some(buf_a), Some(buf_b)];
-    let mut n = 0usize;
-    loop {
-        let buf = bufs[n % 2].take().unwrap();
-        let buf = match eye.capture(buf).await {
-            Ok(buf) => {
-                if n >= 1 && n <= 2 {
-                    dbg_structure(n, &buf);
-                }
+    let free = BufChannel::new();
+    let filled = BufChannel::new();
+    free.send(buf_a).await;
+    free.send(buf_b).await;
 
-                if n >= 1 && n <= 3 {
-                    dbg_frame(n, &buf);
-                }
-
-                if n > 0 {
-                    // первый кадр может начаться посреди кадра, пропускаем
-                    match jpeg_slice(&buf) {
-                        Some(j) => println!("frame #{}: jpeg {} bytes", n, j.len()),
-                        None => println!(
-                            "frame #{}: no SOI/EOI, got {}",
-                            n,
-                            buf.number_of_received_bytes()
-                        ),
-                    }
-                }
-                buf
-            }
-            Err((e, buf)) => {
-                println!("capture error: {:?}", e);
-                buf
-            }
-        };
-        bufs[n % 2] = Some(buf);
-        n += 1;
+    stack.wait_config_up().await;
+    if let Some(cfg) = stack.config_v4() {
+        println!("[main] stream: http://{}/stream", cfg.address.address());
     }
+
+    join4(
+        capture_loop(&mut eye, &free, &filled),
+        push(stack, &free, &filled),
+        stats_push(stack, tsens),
+        lag_probe(),
+    )
+    .await;
 }

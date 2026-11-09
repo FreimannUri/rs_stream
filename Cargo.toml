@@ -4,25 +4,34 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-allocator-api2 =            { version = "=0.3.1", default-features = false, features = ["alloc"] }
 critical-section =          { version = "=1.2.0" }
 embassy-executor =          { version = "=0.10.0" }
+embassy-futures =           { version = "=0.1.2" }
+embassy-net =               { version = "=0.9.1", features = ["tcp", "dhcpv4", "medium-ethernet"] }
+embassy-sync =              { version = "=0.8.0" }
 embassy-time =              { version = "=0.5.1" }
-# aligned =                   { version = "=0.4.3" }
 embedded-hal =              { version = "=1.0.0" }
+
 esp-alloc =                 { version = "=0.11.0" }
 esp-backtrace =             { version = "=0.20.0", features = ["panic-handler", "println"] }
 esp-bootloader-esp-idf =    { version = "=0.6.0" }
 esp-hal =                   { version = "=1.2.0", features = ["unstable", "log-04"] }
-esp-hal-procmacros =        { version = "=0.23.0", package = "esp-hal-procmacros" }
 esp-println =               { version = "=0.18.0", features = ["log-04"] }
-esp-rtos =                  { version = "=0.4.0", features = ["embassy"] }
+esp-radio =                 { version = "=1.0.0-beta.2", features = ["wifi", "unstable", "esp-alloc"] }
+esp-rtos =                  { version = "=0.4.0", features = ["embassy", "esp-radio", "esp-alloc"] }
+
+heapless =                  { version = "=0.9.3" }
 log =                       { version = "=0.4.34" }
+static_cell =               { version = "=2.1.1" }
 
 [patch.crates-io]
-esp-bootloader-esp-idf = { path = "../esp-hal/esp-bootloader-esp-idf" }
-esp-hal = { path = "../esp-hal/esp-hal" }
-esp-rtos = { path = "../esp-hal/esp-rtos" }
+esp-alloc               = { path = "../esp-hal/esp-alloc" }
+esp-backtrace           = { path = "../esp-hal/esp-backtrace" }
+esp-bootloader-esp-idf  = { path = "../esp-hal/esp-bootloader-esp-idf" }
+esp-hal                 = { path = "../esp-hal/esp-hal" }
+esp-println             = { path = "../esp-hal/esp-println" }
+esp-radio               = { path = "../esp-hal/esp-radio" }
+esp-rtos                = { path = "../esp-hal/esp-rtos" }
 
 [features]
 default = ["esp32s3"]
@@ -33,6 +42,7 @@ esp32s3 = [
     "esp-bootloader-esp-idf/esp32s3",
     "esp-hal/esp32s3",
     "esp-println/esp32s3",
+    "esp-radio/esp32s3",
     "esp-rtos/esp32s3",
 ]
 
@@ -42,7 +52,7 @@ debug = true
 panic = "abort"
 
 [profile.dev.package."*"]
-opt-level = 1
+opt-level = 2
 
 [profile.release]
 opt-level = 3
