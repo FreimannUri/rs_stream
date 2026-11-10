@@ -253,16 +253,6 @@ async fn push(stack: Stack<'static>, free: &BufChannel, filled: &BufChannel) -> 
     }
 }
 
-// Measures how late a 10 ms timer fires: a proxy for how busy the executor is.
-async fn lag_probe() -> ! {
-    loop {
-        let t = Instant::now();
-        Timer::after_millis(10).await;
-        let lag = t.elapsed().as_micros().saturating_sub(10_000) as u32;
-        LAG_MAX_US.fetch_max(lag, Relaxed);
-    }
-}
-
 // Sends one JSON line per second to the collector on the laptop.
 async fn stats_push(stack: Stack<'static>, mut tsens: TemperatureSensor<'static>) -> ! {
     let rx = mk_static!([u8; 64], [0; 64]);
@@ -336,6 +326,16 @@ async fn stats_push(stack: Stack<'static>, mut tsens: TemperatureSensor<'static>
         }
         sock.abort();
         println!("[stats] disconnected");
+    }
+}
+
+// Measures how late a 10 ms timer fires: a proxy for how busy the executor is.
+async fn lag_probe() -> ! {
+    loop {
+        let t = Instant::now();
+        Timer::after_millis(10).await;
+        let lag = t.elapsed().as_micros().saturating_sub(10_000) as u32;
+        LAG_MAX_US.fetch_max(lag, Relaxed);
     }
 }
 
